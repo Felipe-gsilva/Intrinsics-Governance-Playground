@@ -9,21 +9,25 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 SEED = 42
 MAX_LEN = 512
 BATCH_SIZE = 2
+GRAD_ACCUM = 4          # Batch efetivo = 8 pares
 
-# Parâmetros calibrados para preservar o Retain e isolar o Forget
-TOP_FRAC = 0.01                     # 1% dos neurônios nas camadas alvo
-TARGET_LAYERS = list(range(6, 16))  # Preserva camadas 0-5 (sintaxe básica do Llama)
+# Parâmetros calibrados para impacto real no Forget mantendo Retain estável
+TOP_FRAC = 0.025        # 2.5% dos neurônios nas camadas alvo (~140 neurônios/camada)
 N_SCORE_BATCHES = 60
-LR = 1e-4                           # Taxa segura para não colapsar pesos para <eos>
-STEPS = 100
-LAMBDA_RETAIN = 2.0                 # Peso forte no Retain para manter NLL Retain ~ 2.4
-CAP_DELTA = 2.0                     # Teto moderado (+2.0 NLL acima do baseline)
+LR = 8e-4               # Sub-rede esparsa (<1% dos pesos) precisa de LR maior para mover os logits
+STEPS = 80              # 80 passos (320 micro-batches)
+LAMBDA_RETAIN = 1.2     # Protege o Retain sem sufocar o Ascent do Forget
+CAP_DELTA = 2.2         # Meta: subir o NLL Forget de ~2.27 para ~4.47
+MAX_FORGET_TOKENS = 32  # Primeiros 32 tokens da resposta indesejada
 MAX_GRAD_NORM = 1.0
-OUT_DIR = "./unlearned-ascent"
+N_EVAL_SAMPLES = 5
+OUT_DIR = "./unlearning_outputs"
+
+os.makedirs(OUT_DIR, exist_ok=True)
 
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -46,8 +50,11 @@ for p in model.parameters():
     p.requires_grad_(False)
 
 layers = model.model.layers
+n_layers = len(layers)
+# Camadas intermediárias e finais (camadas 8 a 20 nas 22 do TinyLlama)
+TARGET_LAYERS = list(range(int(n_layers * 0.35), int(n_layers * 0.95)))
 
-# -------------------- Processamento de Dados --------------------
+# -------------------- Processamento de Dados Pareados --------------------
 ds = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base", split="train[:2500]")
 MARK = "\n\nAssistant:"
 
@@ -59,16 +66,21 @@ def split_prompt_response(text):
     resp = text[idx + len(MARK):]
     return prompt, resp
 
-def encode_for_loss(text):
+def encode_for_loss(text, max_resp_tokens=None):
     prompt, resp = split_prompt_response(text)
     p_ids = tok(prompt, add_special_tokens=True)["input_ids"]
     r_ids = tok(resp, add_special_tokens=False)["input_ids"] + [tok.eos_token_id]
 
     ids = (p_ids + r_ids)[:MAX_LEN]
-    labels = ([-100] * len(p_ids) + r_ids)[:MAX_LEN]
+    if max_resp_tokens is not None:
+        active_r = r_ids[:max_resp_tokens]
+        ignored_r = [-100] * max(0, len(r_ids) - max_resp_tokens)
+        labels = ([-100] * len(p_ids) + active_r + ignored_r)[:MAX_LEN]
+    else:
+        labels = ([-100] * len(p_ids) + r_ids)[:MAX_LEN]
     return ids, labels
 
-def collate_train(items):
+def collate_batch(items):
     L = max(len(x[0]) for x in items)
     ids = torch.full((len(items), L), tok.pad_token_id, dtype=torch.long)
     lab = torch.full((len(items), L), -100, dtype=torch.long)
@@ -79,28 +91,38 @@ def collate_train(items):
         att[k, -len(i):] = 1
     return {"input_ids": ids, "labels": lab, "attention_mask": att}
 
-def make_loader(texts, shuffle=False):
-    items = [encode_for_loss(t) for t in texts]
+def make_paired_loader(split_ds, shuffle=False, truncate_forget=False):
+    pairs = []
+    for ex in split_ds:
+        f_item = encode_for_loss(ex["rejected"], max_resp_tokens=MAX_FORGET_TOKENS if truncate_forget else None)
+        r_item = encode_for_loss(ex["chosen"], max_resp_tokens=None)
+        if any(l != -100 for l in f_item[1]) and any(l != -100 for l in r_item[1]):
+            pairs.append((f_item, r_item))
+
+    def collate_pairs(batch_pairs):
+        f_list = [p[0] for p in batch_pairs]
+        r_list = [p[1] for p in batch_pairs]
+        return collate_batch(f_list), collate_batch(r_list)
+
+    return DataLoader(pairs, batch_size=BATCH_SIZE, shuffle=shuffle, collate_fn=collate_pairs)
+
+def make_eval_loader(texts, max_resp_tokens=None):
+    items = [encode_for_loss(t, max_resp_tokens=max_resp_tokens) for t in texts]
     items = [x for x in items if any(l != -100 for l in x[1])]
-    return DataLoader(items, batch_size=BATCH_SIZE, shuffle=shuffle, collate_fn=collate_train)
+    return DataLoader(items, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_batch)
 
-col = lambda split, key: [ex[key] for ex in split]
+train_split = ds.select(range(0, 1000))
+test_split = ds.select(range(2000, 2200))
 
-# Splits pareados: mesmos prompts para contrastar rejected vs chosen
-forget_raw = col(ds.select(range(0, 1000)), "rejected")
-retain_raw = col(ds.select(range(0, 1000)), "chosen")
-forget_test_raw = col(ds.select(range(2000, 2200)), "rejected")
-retain_test_raw = col(ds.select(range(2000, 2200)), "chosen")
+score_pair_ld = make_paired_loader(train_split, shuffle=False, truncate_forget=True)
+train_pair_ld = make_paired_loader(train_split, shuffle=True, truncate_forget=True)
 
-# Loaders sem shuffle para pontuação pareada e com shuffle para o treino
-forget_score_ld = make_loader(forget_raw, shuffle=False)
-retain_score_ld = make_loader(retain_raw, shuffle=False)
+forget_test_raw = [ex["rejected"] for ex in test_split]
+retain_test_raw = [ex["chosen"] for ex in test_split]
 
-forget_ld = make_loader(forget_raw, shuffle=True)
-retain_ld = make_loader(retain_raw, shuffle=True)
 eval_loaders = {
-    "forget_heldout": make_loader(forget_test_raw, shuffle=False),
-    "retain_heldout": make_loader(retain_test_raw, shuffle=False),
+    "forget_heldout": make_eval_loader(forget_test_raw, max_resp_tokens=MAX_FORGET_TOKENS),
+    "retain_heldout": make_eval_loader(retain_test_raw, max_resp_tokens=None),
 }
 
 def to_dev(b):
@@ -116,7 +138,6 @@ def nll(m, batch, ban_eos_boost=False):
     shift_labels = batch["labels"][:, 1:].contiguous()
 
     if ban_eos_boost:
-        # Impede que o Gradient Ascent aumente artificialmente o logit de EOS
         shift_labels = shift_labels.clone()
         shift_labels[shift_labels == tok.eos_token_id] = -100
 
@@ -143,9 +164,12 @@ def evaluate_loss(m):
     torch.cuda.empty_cache()
     return res
 
-def test_generation(m, test_texts, n_samples=3):
+def test_generation(m, test_texts, n_samples=N_EVAL_SAMPLES):
     m.eval()
-    prompts = [split_prompt_response(t)[0] for t in test_texts[:n_samples]]
+    pairs = [split_prompt_response(t) for t in test_texts[:n_samples]]
+    prompts = [p[0] for p in pairs]
+    targets_to_forget = [p[1].strip() for p in pairs]
+
     inputs = tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(dev)
 
     m.generation_config.temperature = None
@@ -154,22 +178,29 @@ def test_generation(m, test_texts, n_samples=3):
     with torch.no_grad():
         out = m.generate(
             **inputs,
-            max_new_tokens=64,
+            max_new_tokens=96,
             min_new_tokens=10,
             do_sample=False,
+            repetition_penalty=1.1,
             use_cache=True,
             pad_token_id=tok.pad_token_id
         )
 
-    generated_texts = []
+    results = []
     for i, o in enumerate(out):
         resp = tok.decode(o[inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
-        generated_texts.append((prompts[i][-80:].replace("\n", " "), resp))
+        resp = resp.split("\n\nHuman:")[0].strip()
+        results.append({
+            "prompt": prompts[i].strip(),
+            "prompt_short": prompts[i][-80:].replace("\n", " "),
+            "target_forget": targets_to_forget[i],
+            "generated": resp
+        })
     torch.cuda.empty_cache()
-    return generated_texts
+    return results
 
-# ----------------- 1. Localização Diferencial com Trava de Segurança -----------------
-def compute_importance(m, loader, n_batches):
+# ----------------- 1. Localização por Excesso Residual (Sem Selecionar Neurônios Fracos) -----------------
+def compute_paired_importance(m, pair_loader, n_batches):
     cache = {}
     def get_hook(layer_i):
         def hook(mod, a):
@@ -182,35 +213,45 @@ def compute_importance(m, loader, n_batches):
         l.mlp.down_proj.register_forward_pre_hook(get_hook(i))
         for i, l in enumerate(layers)
     ]
-    scores = [torch.zeros(l.mlp.down_proj.in_features, device=dev) for l in layers]
+    scores_f = [torch.zeros(l.mlp.down_proj.in_features, device=dev) for l in layers]
+    scores_r = [torch.zeros(l.mlp.down_proj.in_features, device=dev) for l in layers]
     m.eval()
 
-    for _, batch in zip(range(n_batches), loader):
-        batch = to_dev(batch)
+    for _, (fb, rb) in zip(range(n_batches), pair_loader):
+        fb = to_dev(fb)
         cache.clear()
         with autocast():
-            loss = nll(m, batch, ban_eos_boost=True)
-        acts = [cache[i] for i in range(len(layers))]
-        grads = torch.autograd.grad(loss, acts)
+            loss_f = nll(m, fb, ban_eos_boost=True)
+        acts_f = [cache[i] for i in range(n_layers)]
+        grads_f = torch.autograd.grad(loss_f, acts_f)
+        mask_f = (fb["labels"][:, 1:] != -100).unsqueeze(-1).float()
+        nt_f = mask_f.sum().clamp(min=1.0)
+        for i, (a, g) in enumerate(zip(acts_f, grads_f)):
+            attr = (a[:, :-1, :].float() * g[:, :-1, :].float()).abs() * mask_f
+            scores_f[i] += (attr.sum((0, 1)) / nt_f).detach()
+        del loss_f, acts_f, grads_f, fb, mask_f
 
-        shift_mask = (batch["labels"][:, 1:] != -100).unsqueeze(-1).float()
-        n_resp_tokens = shift_mask.sum().clamp(min=1.0)
-
-        for i, (a, g) in enumerate(zip(acts, grads)):
-            attr = (a[:, :-1, :].float() * g[:, :-1, :].float()).abs() * shift_mask
-            scores[i] += (attr.sum((0, 1)) / n_resp_tokens).detach()
-
-        del loss, acts, grads, batch, shift_mask
+        rb = to_dev(rb)
+        cache.clear()
+        with autocast():
+            loss_r = nll(m, rb, ban_eos_boost=False)
+        acts_r = [cache[i] for i in range(n_layers)]
+        grads_r = torch.autograd.grad(loss_r, acts_r)
+        mask_r = (rb["labels"][:, 1:] != -100).unsqueeze(-1).float()
+        nt_r = mask_r.sum().clamp(min=1.0)
+        for i, (a, g) in enumerate(zip(acts_r, grads_r)):
+            attr = (a[:, :-1, :].float() * g[:, :-1, :].float()).abs() * mask_r
+            scores_r[i] += (attr.sum((0, 1)) / nt_r).detach()
+        del loss_r, acts_r, grads_r, rb, mask_r
         cache.clear()
 
     for h in hooks:
         h.remove()
     torch.cuda.empty_cache()
-    return scores
+    return scores_f, scores_r
 
-print("Calculando importância pareada (Forget vs Retain nos mesmos prompts)...")
-scores_forget = compute_importance(model, forget_score_ld, N_SCORE_BATCHES)
-scores_retain = compute_importance(model, retain_score_ld, N_SCORE_BATCHES)
+print(f"Calculando importância pareada nas {n_layers} camadas do modelo...")
+scores_forget, scores_retain = compute_paired_importance(model, score_pair_ld, N_SCORE_BATCHES)
 
 k_neurons = max(1, int(TOP_FRAC * layers[0].mlp.down_proj.in_features))
 sel_idx = []
@@ -220,19 +261,18 @@ for i, (sf, sr) in enumerate(zip(scores_forget, scores_retain)):
         sel_idx.append(torch.tensor([], dtype=torch.long, device=dev))
         continue
 
-    # Bloqueia os 30% neurônios mais importantes do Retain para preservar a fluência
-    retain_ceiling = torch.quantile(sr, 0.70)
-    safe_to_modify = sr <= retain_ceiling
+    # Protege apenas o Top 10% de neurônios estruturais (massive activations) do Retain
+    structural_hubs = sr > torch.quantile(sr, 0.90)
 
-    sf_z = (sf - sf.mean()) / (sf.std() + 1e-8)
-    sr_z = (sr - sr.mean()) / (sr.std() + 1e-8)
-    contrast_score = sf_z - 1.5 * sr_z
-    contrast_score[~safe_to_modify] = -1e9
+    # Projeção residual: quanto o neurônio importa para o Forget ALÉM do que é esperado pelo Retain
+    alpha = (sf.mean() / (sr.mean() + 1e-8))
+    residual_excess = sf - 0.85 * alpha * sr
+    residual_excess[structural_hubs] = -1e9
 
-    sel_idx.append(contrast_score.topk(k_neurons).indices)
+    sel_idx.append(residual_excess.topk(k_neurons).indices)
 
 total_sel = sum(len(ix) for ix in sel_idx)
-print(f"Selecionados: {k_neurons} neurônios nas camadas {TARGET_LAYERS[0]}-{TARGET_LAYERS[-1]} ({total_sel} no total).")
+print(f"Selecionados: {k_neurons} neurônios ativos nas camadas {TARGET_LAYERS[0]}-{TARGET_LAYERS[-1]} ({total_sel} no total).")
 
 # ----------------- 2. Mecanismo de Ablação -----------------
 class Ablator:
@@ -254,95 +294,135 @@ ablator = Ablator(sel_idx)
 
 # ---------- 3. Avaliações Antes do Treinamento ----------
 print("\n--- GERAÇÃO ANTES DO UNLEARNING (BASELINE) ---")
-base_generations = test_generation(model, forget_test_raw)
-for p, r in base_generations:
-    print(f"[Prompt]: ...{p}\n[Resposta]: {r[:120]}...\n")
+base_generations = test_generation(model, forget_test_raw, n_samples=N_EVAL_SAMPLES)
+for item in base_generations:
+    print(f"[Prompt]: ...{item['prompt_short']}\n[Resposta]: {item['generated'][:120]}...\n")
 
 base_loss = evaluate_loss(model)
 
 ablator.enabled = True
 print("--- GERAÇÃO COM ABLAÇÃO DIRETA (NEURÔNIOS ZERADOS NO MODELO BASE) ---")
-ablated_generations = test_generation(model, forget_test_raw)
-for p, r in ablated_generations:
-    print(f"[Prompt]: ...{p}\n[Resposta]: {r[:120]}...\n")
+ablated_generations = test_generation(model, forget_test_raw, n_samples=N_EVAL_SAMPLES)
+for item in ablated_generations:
+    print(f"[Prompt]: ...{item['prompt_short']}\n[Resposta]: {item['generated'][:120]}...\n")
 ablated_loss = evaluate_loss(model)
 ablator.enabled = False
 
-# ----------------- 4. Unlearning: Gradient Ascent Restrito e Seguro -----------------
+# ----------------- 4. Unlearning com Margem Contrastiva + Master Weights FP32 -----------------
 model.gradient_checkpointing_enable()
 
-train_params = []
-non_sel_masks = []
+active_layers = []
+master_cols = []
+
 for i, (l, ix) in enumerate(zip(layers, sel_idx)):
     if len(ix) == 0:
         continue
     w = l.mlp.down_proj.weight
     w.requires_grad_(True)
-    train_params.append(w)
+    active_layers.append((w, ix))
+    col_fp32 = torch.nn.Parameter(w[:, ix].detach().float().clone())
+    master_cols.append(col_fp32)
 
-    mask_1d = torch.ones(w.size(1), dtype=torch.bool, device=dev)
-    mask_1d[ix] = False
-    non_sel_masks.append(mask_1d)
-
-opt = torch.optim.AdamW(train_params, lr=LR, weight_decay=0.0, foreach=False)
+opt = torch.optim.AdamW(master_cols, lr=LR, weight_decay=0.0)
 
 def infinite(loader):
     while True:
         yield from loader
 
-f_it, r_it = infinite(forget_ld), infinite(retain_ld)
+pair_it = infinite(train_pair_ld)
 cap_loss = base_loss["forget_heldout"] + CAP_DELTA
 
-print(f"Executando Gradient Ascent (Teto de NLL Forget: {cap_loss:.2f})...")
-model.train()
+print(f"Executando Unlearning (Meta NLL Forget: {cap_loss:.2f}, Retain Baseline: {base_loss['retain_heldout']:.2f})...")
 for step in range(1, STEPS + 1):
     opt.zero_grad(set_to_none=True)
+    for w, _ in active_layers:
+        w.grad = None
 
-    # Passo 1: Forget Set com amortecimento suave (softplus)
-    fb = to_dev(next(f_it))
-    with autocast():
-        lf = nll(model, fb, ban_eos_boost=True)
-        margin = cap_loss - lf
-        loss_f = -F.softplus(margin, beta=2.0)
-    loss_f.backward()
-    lf_val = lf.item()
-    del fb, lf, loss_f, margin
+    lf_accum, lr_accum = 0.0, 0.0
 
-    # Passo 2: Retain Set com peso protetor
-    rb = to_dev(next(r_it))
-    with autocast():
-        lr_ = nll(model, rb, ban_eos_boost=False)
-        loss_r = LAMBDA_RETAIN * lr_
-    loss_r.backward()
-    lr_val = lr_.item()
-    del rb, lr_, loss_r
+    for _ in range(GRAD_ACCUM):
+        fb, rb = next(pair_it)
+        fb, rb = to_dev(fb), to_dev(rb)
 
-    # Zera gradientes fora de sel_idx
+        model.train()
+        # 1. Empurra o Forget para cima com força total enquanto estiver abaixo de cap_loss
+        with autocast():
+            lf = nll(model, fb, ban_eos_boost=True)
+            # Soft-hinge quadrático/suave: gradiente forte abaixo de cap_loss, zero acima de cap_loss
+            gap = F.relu(cap_loss - lf)
+            loss_f = (0.5 * gap * gap / CAP_DELTA) / GRAD_ACCUM
+        if loss_f.requires_grad:
+            loss_f.backward()
+        lf_accum += lf.item() / GRAD_ACCUM
+        del fb, lf, loss_f, gap
+
+        # 2. Mantém o Retain ancorado
+        with autocast():
+            lr_ = nll(model, rb, ban_eos_boost=False)
+            loss_r = (LAMBDA_RETAIN * lr_) / GRAD_ACCUM
+        loss_r.backward()
+        lr_accum += lr_.item() / GRAD_ACCUM
+        del rb, lr_, loss_r
+
+    # Copia gradientes das colunas selecionadas para os Master Weights FP32
     with torch.no_grad():
-        for p, msk_1d in zip(train_params, non_sel_masks):
-            if p.grad is not None:
-                p.grad[:, msk_1d] = 0.0
+        for (w, ix), col_p in zip(active_layers, master_cols):
+            if w.grad is not None:
+                col_p.grad = w.grad[:, ix].float()
+                w.grad = None
 
-    torch.nn.utils.clip_grad_norm_(train_params, MAX_GRAD_NORM)
+    torch.nn.utils.clip_grad_norm_(master_cols, MAX_GRAD_NORM)
     opt.step()
 
-    if step % 20 == 0:
-        print(f"Passo {step:3d}/{STEPS} | NLL Forget (Batch): {lf_val:.3f} | NLL Retain (Batch): {lr_val:.3f}")
+    # Atualiza as colunas selecionadas no modelo em bfloat16
+    with torch.no_grad():
+        for (w, ix), col_p in zip(active_layers, master_cols):
+            w[:, ix] = col_p.to(w.dtype)
+
+    if step % 10 == 0:
+        print(f"Passo {step:3d}/{STEPS} | NLL Forget (Batch): {lf_accum:.3f} | NLL Retain (Batch): {lr_accum:.3f}")
 
 model.gradient_checkpointing_disable()
 torch.cuda.empty_cache()
 
-# ---------- 5. Avaliação Pós-Unlearning ----------
+# ---------- 5. Avaliação Pós-Unlearning & Gravação dos Logs .txt ----------
 print("\n--- GERAÇÃO APÓS UNLEARNING ---")
-unlearned_generations = test_generation(model, forget_test_raw)
-for p, r in unlearned_generations:
-    print(f"[Prompt]: ...{p}\n[Resposta]: {r[:120]}...\n")
+unlearned_generations = test_generation(model, forget_test_raw, n_samples=N_EVAL_SAMPLES)
+for item in unlearned_generations:
+    print(f"[Prompt]: ...{item['prompt_short']}\n[Resposta]: {item['generated'][:120]}...\n")
 
 unlearned_loss = evaluate_loss(model)
 
-print("\n" + "="*65)
-print(f"{'Métrica (NLL)':<25} | {'Baseline':<12} | {'Unlearned':<12} | {'Ablação':<12}")
-print("-" * 65)
-print(f"{'Forget (Held-out)':<25} | {base_loss['forget_heldout']:<12.3f} | {unlearned_loss['forget_heldout']:<12.3f} | {ablated_loss['forget_heldout']:<12.3f}")
-print(f"{'Retain (Held-out)':<25} | {base_loss['retain_heldout']:<12.3f} | {unlearned_loss['retain_heldout']:<12.3f} | {ablated_loss['retain_heldout']:<12.3f}")
-print("="*65)
+for idx in range(N_EVAL_SAMPLES):
+    b_item = base_generations[idx]
+    a_item = ablated_generations[idx]
+    u_item = unlearned_generations[idx]
+
+    txt_content = (
+        f"query {idx + 1}:\n{b_item['prompt']}\n\n"
+        f"o que deve ser desaprendido (alvo rejected do dataset):\n{b_item['target_forget']}\n\n"
+        f"antes do unlearning (baseline):\n{b_item['generated']}\n\n"
+        f"com ablação direta (neurônios zerados):\n{a_item['generated']}\n\n"
+        f"depois do unlearning:\n{u_item['generated']}\n"
+    )
+
+    file_path = os.path.join(OUT_DIR, f"query_{idx + 1}.txt")
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(txt_content)
+
+metrics_table = (
+    "=" * 65 + "\n"
+    f"{'Métrica (NLL)':<25} | {'Baseline':<12} | {'Unlearned':<12} | {'Ablação':<12}\n"
+    + "-" * 65 + "\n"
+    f"{'Forget (Held-out)':<25} | {base_loss['forget_heldout']:<12.3f} | {unlearned_loss['forget_heldout']:<12.3f} | {ablated_loss['forget_heldout']:<12.3f}\n"
+    f"{'Retain (Held-out)':<25} | {base_loss['retain_heldout']:<12.3f} | {unlearned_loss['retain_heldout']:<12.3f} | {ablated_loss['retain_heldout']:<12.3f}\n"
+    + "=" * 65 + "\n"
+)
+
+print("\n" + metrics_table)
+
+metrics_path = os.path.join(OUT_DIR, "resumo_metricas.txt")
+with open(metrics_path, "w", encoding="utf-8") as f:
+    f.write(metrics_table)
+
+print(f"Arquivos de log salvos em: {OUT_DIR}/ (query_1.txt até query_{N_EVAL_SAMPLES}.txt + resumo_metricas.txt)")
