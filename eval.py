@@ -1,3 +1,4 @@
+import os
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -5,6 +6,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 # 1. Definição dos caminhos
 base_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 adapter_dir = "./lora-dpo-safety/final_adapter"
+output_dir = "./eval_outputs"
+
+os.makedirs(output_dir, exist_ok=True)
 
 # 2. Configuração de quantização
 bnb_config = BitsAndBytesConfig(
@@ -73,17 +77,25 @@ def generate_text(prompt_text, active_lora=True):
     # Corta caso o modelo tente simular o próximo turno "Human:"
     return resp.split("\n\nHuman:")[0].strip()
 
-# 4. Loop de Comparação
+# 4. Loop de Comparação e Gravação dos Arquivos .txt
 for idx, prompt in enumerate(test_prompts, start=1):
-    print("=" * 75)
-    print(f"PROMPT {idx}: {prompt}")
-    print("=" * 75)
-
     ans_base = generate_text(prompt, active_lora=False)
-    print("\n[ORIGINAL / BASE (Sem DPO)]:")
-    print(ans_base)
-
     ans_dpo = generate_text(prompt, active_lora=True)
-    print("\n[PÓS-DPO (Com Adaptador de Segurança)]:")
-    print(ans_dpo)
-    print("\n")
+
+    # Monta o conteúdo no formato solicitado
+    file_content = (
+        f"query {idx}: {prompt}\n\n"
+        f"sem DPO:\n{ans_base}\n\n"
+        f"com DPO:\n{ans_dpo}\n"
+    )
+
+    # Salva um arquivo .txt individual para a query i
+    file_path = os.path.join(output_dir, f"query_{idx}.txt")
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(file_content)
+
+    # Exibe no terminal e confirma o salvamento
+    print("=" * 75)
+    print(file_content.strip())
+    print(f"\n[Salvo em: {file_path}]")
+    print("=" * 75 + "\n")

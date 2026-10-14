@@ -78,7 +78,6 @@ dpo_args = DPOConfig(
     logging_steps=10,
     save_strategy="no",              # Salvaremos manualmente no final em uma pasta fixa
     max_length=512,
-    max_prompt_length=256,
 )
 
 # 5. Trainer
